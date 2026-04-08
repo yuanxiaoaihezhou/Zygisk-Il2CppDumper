@@ -6,12 +6,15 @@
 #include <dlfcn.h>
 #include <cstdlib>
 #include <cstring>
+#include <cstdio>
 #include <cinttypes>
 #include <string>
 #include <vector>
 #include <sstream>
 #include <fstream>
 #include <unistd.h>
+#include <algorithm>
+#include <link.h>
 #include "xdl.h"
 #include "log.h"
 #include "il2cpp-tabledefs.h"
@@ -24,6 +27,164 @@
 #undef DO_API
 
 static uint64_t il2cpp_base = 0;
+
+namespace {
+    struct MemoryRange {
+        uintptr_t start = 0;
+        uintptr_t end = 0;
+    };
+
+    struct Il2CppSoInfo {
+        uintptr_t base = 0;
+        const ElfW(Phdr) *phdr = nullptr;
+        size_t phnum = 0;
+    };
+
+    int find_libil2cpp_callback(dl_phdr_info *info, size_t, void *data) {
+        if (!info || !info->dlpi_name || !data) {
+            return 0;
+        }
+        std::string name(info->dlpi_name);
+        if (name.empty()) {
+            return 0;
+        }
+        auto pos = name.rfind('/');
+        const auto &library_name = pos == std::string::npos ? name : name.substr(pos + 1);
+        if (library_name != "libil2cpp.so") {
+            return 0;
+        }
+        auto *result = reinterpret_cast<Il2CppSoInfo *>(data);
+        result->base = info->dlpi_addr;
+        result->phdr = info->dlpi_phdr;
+        result->phnum = info->dlpi_phnum;
+        return 1;
+    }
+
+    bool get_libil2cpp_mapped_ranges(std::vector<MemoryRange> &ranges) {
+        std::ifstream maps("/proc/self/maps");
+        if (!maps.is_open()) {
+            LOGW("Failed to open /proc/self/maps");
+            return false;
+        }
+        std::string line;
+        while (std::getline(maps, line)) {
+            if (line.find("libil2cpp.so") == std::string::npos) {
+                continue;
+            }
+            unsigned long start = 0;
+            unsigned long end = 0;
+            if (sscanf(line.c_str(), "%lx-%lx", &start, &end) == 2 && start < end) {
+                ranges.push_back({static_cast<uintptr_t>(start), static_cast<uintptr_t>(end)});
+            }
+        }
+        return !ranges.empty();
+    }
+
+    void normalize_ranges(std::vector<MemoryRange> &ranges) {
+        if (ranges.empty()) {
+            return;
+        }
+        std::sort(ranges.begin(), ranges.end(), [](const MemoryRange &a, const MemoryRange &b) {
+            return a.start < b.start;
+        });
+        std::vector<MemoryRange> merged;
+        merged.reserve(ranges.size());
+        merged.push_back(ranges[0]);
+        for (size_t i = 1; i < ranges.size(); ++i) {
+            auto &last = merged.back();
+            const auto &current = ranges[i];
+            if (current.start <= last.end) {
+                if (current.end > last.end) {
+                    last.end = current.end;
+                }
+            } else {
+                merged.push_back(current);
+            }
+        }
+        ranges.swap(merged);
+    }
+
+    bool is_address_range_valid(uintptr_t start, size_t size, const std::vector<MemoryRange> &ranges) {
+        if (size == 0) {
+            return true;
+        }
+        uintptr_t end = 0;
+        if (__builtin_add_overflow(start, static_cast<uintptr_t>(size), &end)) {
+            return false;
+        }
+        for (const auto &range: ranges) {
+            if (start >= range.start && end <= range.end) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool dump_libil2cpp_so(const char *outDir) {
+        Il2CppSoInfo info;
+        if (dl_iterate_phdr(find_libil2cpp_callback, &info) == 0 || !info.base || !info.phdr || !info.phnum) {
+            LOGW("Failed to find loaded libil2cpp.so");
+            return false;
+        }
+        std::vector<MemoryRange> mapped_ranges;
+        if (!get_libil2cpp_mapped_ranges(mapped_ranges)) {
+            LOGW("Failed to get mapped ranges for libil2cpp.so");
+            return false;
+        }
+        normalize_ranges(mapped_ranges);
+
+        size_t file_size = 0;
+        for (size_t i = 0; i < info.phnum; ++i) {
+            const auto &ph = info.phdr[i];
+            if (ph.p_type != PT_LOAD || ph.p_filesz == 0) {
+                continue;
+            }
+            file_size = std::max(file_size, static_cast<size_t>(ph.p_offset + ph.p_filesz));
+        }
+        if (file_size == 0) {
+            LOGW("libil2cpp.so PT_LOAD not found");
+            return false;
+        }
+
+        std::vector<uint8_t> buffer(file_size, 0);
+        auto *base = reinterpret_cast<const uint8_t *>(info.base);
+        for (size_t i = 0; i < info.phnum; ++i) {
+            const auto &ph = info.phdr[i];
+            auto segment_offset = static_cast<size_t>(ph.p_offset);
+            auto segment_size = static_cast<size_t>(ph.p_filesz);
+            if (ph.p_type != PT_LOAD || segment_size == 0 || segment_offset > file_size ||
+                segment_size > file_size - segment_offset) {
+                continue;
+            }
+            auto segment_virtual_address = static_cast<size_t>(ph.p_vaddr);
+            uintptr_t source_start = 0;
+            if (__builtin_add_overflow(info.base, static_cast<uintptr_t>(segment_virtual_address), &source_start)) {
+                LOGW("Segment address overflow: vaddr=0x%zx", segment_virtual_address);
+                continue;
+            }
+            if (!is_address_range_valid(source_start, segment_size, mapped_ranges)) {
+                LOGW("Skip unmapped segment: start=0x%" PRIxPTR ", size=0x%zx", source_start, segment_size);
+                continue;
+            }
+            memcpy(buffer.data() + segment_offset, reinterpret_cast<const void *>(source_start), segment_size);
+        }
+
+        auto outPath = std::string(outDir).append("/files/libil2cpp.so");
+        std::ofstream outStream(outPath, std::ios::binary);
+        if (!outStream.is_open()) {
+            LOGW("Failed to open output file: %s", outPath.c_str());
+            return false;
+        }
+        outStream.write(reinterpret_cast<const char *>(buffer.data()), static_cast<std::streamsize>(buffer.size()));
+        if (!outStream.good()) {
+            LOGW("Failed to write libil2cpp.so");
+            return false;
+        }
+        outStream.close();
+        LOGI("dumped libil2cpp.so to %s", outPath.c_str());
+        return true;
+    }
+}
 
 void init_il2cpp_api(void *handle) {
 #define DO_API(r, n, p) {                      \
@@ -345,6 +506,7 @@ void il2cpp_api_init(void *handle) {
 
 void il2cpp_dump(const char *outDir) {
     LOGI("dumping...");
+    dump_libil2cpp_so(outDir);
     size_t size;
     auto domain = il2cpp_domain_get();
     auto assemblies = il2cpp_domain_get_assemblies(domain, &size);
