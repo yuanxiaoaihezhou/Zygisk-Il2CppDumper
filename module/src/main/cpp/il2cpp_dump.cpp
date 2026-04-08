@@ -80,12 +80,33 @@ namespace {
         return !ranges.empty();
     }
 
+    void normalize_ranges(std::vector<MemoryRange> &ranges) {
+        if (ranges.empty()) {
+            return;
+        }
+        std::sort(ranges.begin(), ranges.end(), [](const MemoryRange &a, const MemoryRange &b) {
+            return a.start < b.start;
+        });
+        std::vector<MemoryRange> merged;
+        merged.reserve(ranges.size());
+        merged.push_back(ranges[0]);
+        for (size_t i = 1; i < ranges.size(); ++i) {
+            auto &last = merged.back();
+            const auto &current = ranges[i];
+            if (current.start <= last.end) {
+                if (current.end > last.end) {
+                    last.end = current.end;
+                }
+            } else {
+                merged.push_back(current);
+            }
+        }
+        ranges.swap(merged);
+    }
+
     bool is_address_range_valid(uintptr_t start, size_t size, const std::vector<MemoryRange> &ranges) {
         if (size == 0) {
             return true;
-        }
-        if (size > static_cast<size_t>(UINTPTR_MAX)) {
-            return false;
         }
         uintptr_t end = 0;
         if (__builtin_add_overflow(start, static_cast<uintptr_t>(size), &end)) {
@@ -110,6 +131,7 @@ namespace {
             LOGW("Failed to get mapped ranges for libil2cpp.so");
             return false;
         }
+        normalize_ranges(mapped_ranges);
 
         size_t file_size = 0;
         for (size_t i = 0; i < info.phnum; ++i) {
@@ -135,10 +157,6 @@ namespace {
                 continue;
             }
             auto segment_virtual_address = static_cast<size_t>(ph.p_vaddr);
-            if (segment_virtual_address > static_cast<size_t>(UINTPTR_MAX)) {
-                LOGW("Segment vaddr too large: vaddr=0x%zx", segment_virtual_address);
-                continue;
-            }
             uintptr_t source_start = 0;
             if (__builtin_add_overflow(info.base, static_cast<uintptr_t>(segment_virtual_address), &source_start)) {
                 LOGW("Segment address overflow: vaddr=0x%zx", segment_virtual_address);
