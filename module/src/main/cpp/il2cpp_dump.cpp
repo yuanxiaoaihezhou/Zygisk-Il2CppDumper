@@ -79,11 +79,13 @@ namespace {
         auto *base = reinterpret_cast<const uint8_t *>(info.base);
         for (size_t i = 0; i < info.phnum; ++i) {
             const auto &ph = info.phdr[i];
-            if (ph.p_type != PT_LOAD || ph.p_filesz == 0 || ph.p_offset >= file_size) {
+            auto segment_offset = static_cast<size_t>(ph.p_offset);
+            auto segment_size = static_cast<size_t>(ph.p_filesz);
+            if (ph.p_type != PT_LOAD || segment_size == 0 || segment_offset > file_size ||
+                segment_size > file_size - segment_offset) {
                 continue;
             }
-            auto copy_size = std::min(static_cast<size_t>(ph.p_filesz), file_size - static_cast<size_t>(ph.p_offset));
-            memcpy(buffer.data() + ph.p_offset, base + ph.p_vaddr, copy_size);
+            memcpy(buffer.data() + segment_offset, base + ph.p_vaddr, segment_size);
         }
 
         auto outPath = std::string(outDir).append("/files/libil2cpp.so");
