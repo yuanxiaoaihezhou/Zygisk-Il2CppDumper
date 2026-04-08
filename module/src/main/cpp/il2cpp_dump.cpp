@@ -7,11 +7,14 @@
 #include <cstdlib>
 #include <cstring>
 #include <cinttypes>
+#include <cstdint>
 #include <string>
 #include <vector>
 #include <sstream>
 #include <fstream>
 #include <unistd.h>
+#include <algorithm>
+#include <link.h>
 #include "xdl.h"
 #include "log.h"
 #include "il2cpp-tabledefs.h"
@@ -24,6 +27,81 @@
 #undef DO_API
 
 static uint64_t il2cpp_base = 0;
+
+namespace {
+    struct Il2CppSoInfo {
+        uintptr_t base = 0;
+        const ElfW(Phdr) *phdr = nullptr;
+        size_t phnum = 0;
+    };
+
+    int find_libil2cpp_callback(dl_phdr_info *info, size_t, void *data) {
+        if (!info || !info->dlpi_name || !data) {
+            return 0;
+        }
+        std::string name(info->dlpi_name);
+        if (name.empty()) {
+            return 0;
+        }
+        auto pos = name.rfind('/');
+        const auto &so_name = pos == std::string::npos ? name : name.substr(pos + 1);
+        if (so_name != "libil2cpp.so") {
+            return 0;
+        }
+        auto *result = reinterpret_cast<Il2CppSoInfo *>(data);
+        result->base = info->dlpi_addr;
+        result->phdr = info->dlpi_phdr;
+        result->phnum = info->dlpi_phnum;
+        return 1;
+    }
+
+    bool dump_libil2cpp_so(const char *outDir) {
+        Il2CppSoInfo info;
+        if (dl_iterate_phdr(find_libil2cpp_callback, &info) == 0 || !info.base || !info.phdr || !info.phnum) {
+            LOGW("Failed to find loaded libil2cpp.so");
+            return false;
+        }
+
+        size_t file_size = 0;
+        for (size_t i = 0; i < info.phnum; ++i) {
+            const auto &ph = info.phdr[i];
+            if (ph.p_type != PT_LOAD || ph.p_filesz == 0) {
+                continue;
+            }
+            file_size = std::max(file_size, static_cast<size_t>(ph.p_offset + ph.p_filesz));
+        }
+        if (file_size == 0) {
+            LOGW("libil2cpp.so PT_LOAD not found");
+            return false;
+        }
+
+        std::vector<uint8_t> buffer(file_size, 0);
+        auto *base = reinterpret_cast<const uint8_t *>(info.base);
+        for (size_t i = 0; i < info.phnum; ++i) {
+            const auto &ph = info.phdr[i];
+            if (ph.p_type != PT_LOAD || ph.p_filesz == 0 || ph.p_offset >= file_size) {
+                continue;
+            }
+            auto copy_size = std::min(static_cast<size_t>(ph.p_filesz), file_size - static_cast<size_t>(ph.p_offset));
+            memcpy(buffer.data() + ph.p_offset, base + ph.p_vaddr, copy_size);
+        }
+
+        auto outPath = std::string(outDir).append("/files/libil2cpp.so");
+        std::ofstream outStream(outPath, std::ios::binary);
+        if (!outStream.is_open()) {
+            LOGW("Failed to open output file: %s", outPath.c_str());
+            return false;
+        }
+        outStream.write(reinterpret_cast<const char *>(buffer.data()), static_cast<std::streamsize>(buffer.size()));
+        if (!outStream.good()) {
+            LOGW("Failed to write libil2cpp.so");
+            return false;
+        }
+        outStream.close();
+        LOGI("dumped libil2cpp.so to %s", outPath.c_str());
+        return true;
+    }
+}
 
 void init_il2cpp_api(void *handle) {
 #define DO_API(r, n, p) {                      \
@@ -345,6 +423,7 @@ void il2cpp_api_init(void *handle) {
 
 void il2cpp_dump(const char *outDir) {
     LOGI("dumping...");
+    dump_libil2cpp_so(outDir);
     size_t size;
     auto domain = il2cpp_domain_get();
     auto assemblies = il2cpp_domain_get_assemblies(domain, &size);
