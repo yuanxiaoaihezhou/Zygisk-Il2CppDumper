@@ -6,8 +6,8 @@
 #include <dlfcn.h>
 #include <cstdlib>
 #include <cstring>
+#include <cstdio>
 #include <cinttypes>
-#include <cstdint>
 #include <string>
 #include <vector>
 #include <sstream>
@@ -29,6 +29,11 @@
 static uint64_t il2cpp_base = 0;
 
 namespace {
+    struct MemoryRange {
+        uintptr_t start = 0;
+        uintptr_t end = 0;
+    };
+
     struct Il2CppSoInfo {
         uintptr_t base = 0;
         const ElfW(Phdr) *phdr = nullptr;
@@ -44,8 +49,8 @@ namespace {
             return 0;
         }
         auto pos = name.rfind('/');
-        const auto &so_name = pos == std::string::npos ? name : name.substr(pos + 1);
-        if (so_name != "libil2cpp.so") {
+        const auto &library_name = pos == std::string::npos ? name : name.substr(pos + 1);
+        if (library_name != "libil2cpp.so") {
             return 0;
         }
         auto *result = reinterpret_cast<Il2CppSoInfo *>(data);
@@ -55,10 +60,54 @@ namespace {
         return 1;
     }
 
+    bool get_libil2cpp_mapped_ranges(std::vector<MemoryRange> &ranges) {
+        std::ifstream maps("/proc/self/maps");
+        if (!maps.is_open()) {
+            LOGW("Failed to open /proc/self/maps");
+            return false;
+        }
+        std::string line;
+        while (std::getline(maps, line)) {
+            if (line.find("libil2cpp.so") == std::string::npos) {
+                continue;
+            }
+            unsigned long start = 0;
+            unsigned long end = 0;
+            if (sscanf(line.c_str(), "%lx-%lx", &start, &end) == 2 && start < end) {
+                ranges.push_back({static_cast<uintptr_t>(start), static_cast<uintptr_t>(end)});
+            }
+        }
+        return !ranges.empty();
+    }
+
+    bool is_address_range_valid(uintptr_t start, size_t size, const std::vector<MemoryRange> &ranges) {
+        if (size == 0) {
+            return true;
+        }
+        if (size > static_cast<size_t>(UINTPTR_MAX)) {
+            return false;
+        }
+        uintptr_t end = 0;
+        if (__builtin_add_overflow(start, static_cast<uintptr_t>(size), &end)) {
+            return false;
+        }
+        for (const auto &range: ranges) {
+            if (start >= range.start && end <= range.end) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     bool dump_libil2cpp_so(const char *outDir) {
         Il2CppSoInfo info;
         if (dl_iterate_phdr(find_libil2cpp_callback, &info) == 0 || !info.base || !info.phdr || !info.phnum) {
             LOGW("Failed to find loaded libil2cpp.so");
+            return false;
+        }
+        std::vector<MemoryRange> mapped_ranges;
+        if (!get_libil2cpp_mapped_ranges(mapped_ranges)) {
+            LOGW("Failed to get mapped ranges for libil2cpp.so");
             return false;
         }
 
@@ -85,7 +134,21 @@ namespace {
                 segment_size > file_size - segment_offset) {
                 continue;
             }
-            memcpy(buffer.data() + segment_offset, base + ph.p_vaddr, segment_size);
+            auto segment_virtual_address = static_cast<size_t>(ph.p_vaddr);
+            if (segment_virtual_address > static_cast<size_t>(UINTPTR_MAX)) {
+                LOGW("Segment vaddr too large: vaddr=0x%zx", segment_virtual_address);
+                continue;
+            }
+            uintptr_t source_start = 0;
+            if (__builtin_add_overflow(info.base, static_cast<uintptr_t>(segment_virtual_address), &source_start)) {
+                LOGW("Segment address overflow: vaddr=0x%zx", segment_virtual_address);
+                continue;
+            }
+            if (!is_address_range_valid(source_start, segment_size, mapped_ranges)) {
+                LOGW("Skip unmapped segment: start=0x%" PRIxPTR ", size=0x%zx", source_start, segment_size);
+                continue;
+            }
+            memcpy(buffer.data() + segment_offset, reinterpret_cast<const void *>(source_start), segment_size);
         }
 
         auto outPath = std::string(outDir).append("/files/libil2cpp.so");
